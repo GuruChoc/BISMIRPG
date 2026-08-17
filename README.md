@@ -4,18 +4,24 @@ BIS report generation tools for MapleStory Idle RPG.
 
 ## Current baseline
 
-The current generator is based on the v191 OCR/report workflow.
+The current generator is based on the v191 OCR/report workflow and uses a conservative keep-first policy.
 
 Key rules:
 
 - OCR `Equipped` screenshots are authoritative for the actual Basic Preset.
 - If the optimiser export has stale Basic IDs, the report flags the mismatch rather than silently trusting it.
 - Any item physically shown as Equipped is always protected from UNLOCK.
-- Ring, Ring 2, Face Accessory and Necklace receive no special scarcity protection. Party Quest items follow the same keep rules as every other slot.
-- Keep items are those used by presets, selected by spare keep pools, or protected by the 4-substat always-keep rule.
+- Optimiser-selected equipment is never silently substituted.
+- Spare keep pools are recalculated fresh from the current export on every run; no old item IDs or pool selections are carried forward.
+- Pool allocation is unique and left-to-right: Boss -> Normal -> Evasion -> Accuracy.
+- Ring, Ring 2, Face Accessory, Eye Accessory and Necklace keep up to Top 5 per category; other slots keep up to Top 3.
+- Boss and Normal pools score the whole item rather than requiring a literal Boss/Normal Damage line. Useful Crit Rate, Crit Damage, target damage, skill levels, Min/Max Damage, Damage, Attack and related lines can all contribute.
+- Crit Rate is valued strongly only while the current build is below effective 100% Crit Rate.
+- A conservative safety net protects strong recognised multi-line damage combinations and near-best HP/MP/Evasion/Accuracy/Defense rolls. The report intentionally prefers keeping too much gear over recommending deletion of a potentially valuable item.
+- Ring, Ring 2, Face Accessory and Necklace receive no artificial scarcity protection just because they are Party Quest items; quality rolls are protected by the ranking/safety rules instead.
+- Any 4-substat item is always kept.
 - Page 2 groups actions by equipment type, then sorts by true OCR screenshot capture order within that type.
 - T/Lv and first visible substat are taken from the matching OCR screenshot record.
-- Optimiser-selected equipment is never silently substituted.
 
 ## Inputs
 
@@ -30,4 +36,4 @@ The MapleOCR workflow is intended to package these together as `BIS_stats.zip`.
 
 ## Status
 
-This repository currently contains the v191 report-generator baseline. Spare keep-pool selection is still encoded in the generator and is the next area to generalise into a fully current-run ranking calculation.
+The repository now contains the conservative v191 report generator with fresh current-run spare-pool calculation and keep-first safety rules. The current v191 validation run kept 144 of 148 items and produced no UNLOCK recommendations, deliberately favouring false-positive keeps over accidental loss of good gear while the ranking logic is being field-tested.
