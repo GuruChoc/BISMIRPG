@@ -8,8 +8,8 @@ from reportlab.lib import colors
 EXP='/mnt/data/mapleexport(6).txt'
 STATUS='/mnt/data/bis_v191_unzip/lock_status.txt'
 CSV='/mnt/data/bis_v191_unzip/import_review_easyocr_v191.csv'
-OUT='/mnt/data/MapleStory_BIS_Report_20260818_v191_FIXED.pdf'
-TXT='/mnt/data/MapleStory_BIS_Lock_Unlock_20260818_v191_FIXED.txt'
+OUT='/mnt/data/MapleStory_BIS_Report_20260818_v191_CONSERVATIVE.pdf'
+TXT='/mnt/data/MapleStory_BIS_Lock_Unlock_20260818_v191_CONSERVATIVE.txt'
 
 exp=json.load(open(EXP,encoding='utf-8'))
 status={}
@@ -56,43 +56,160 @@ for idx,p in enumerate(presets):
     else:
         effective.append({s:p.get(s,true_basic[s]) for s in slots})
 used=set(i for p in effective for i in p.values() if i)
-# Absolute safety: every OCR Equipped physical item is always kept.
 used.update(true_basic.values())
 basic=true_basic
 
-def find(slot,name,pred=None,all_=False):
-    arr=[it for it in exp['comparisonItemsBySlot'][slot] if it['name']==name]
-    if pred: arr=[it for it in arr if pred(it)]
-    if all_: return [it['id'] for it in arr]
-    if not arr: return None
-    return arr[0]['id']
+# Spare keep pools are ALWAYS recalculated from the current export inventory.
+# No carry-forward IDs or names from a previous report are allowed.
+# Allocation is unique and left-to-right: Boss -> Normal -> Evasion -> Accuracy.
+# Items already used by a preset/Basic are excluded before pool ranking.
+# Ring/Ring 2/Face/Eye/Necklace keep up to Top 5 per category; all other slots Top 3.
+SPECIAL_TOP5={'ring','ring2','face','eye','necklace'}
+BASE=exp.get('stats',{})
+BASE_CRIT=float(BASE.get('critRate',0) or 0)
 
-# Ring, Ring 2, Face and Necklace receive no special scarcity protection.
-# Party Quest items are kept by the same rules as all other equipment: preset use, spare pool selection, or 4-substat rule.
+NORM={
+    'crit-rate':16.0,'crit-damage':17.0,'boss-damage':17.0,'normal-damage':18.0,
+    'damage':22.0,'max-damage-ratio':27.0,'min-damage-ratio':27.0,
+    'defense-penetration':14.0,'skill-damage':20.0,'basic-attack-damage':20.0,
+    'skill-level-4':17.0,'skill-level-3':26.0,'skill-level-2':26.0,'skill-level-1':26.0,
+    'attack':9000.0,'main-stat':1400.0,
+}
+crit_need=max(0.0,100.0-BASE_CRIT)
+crit_weight=1.30 if crit_need>0.5 else 0.08
+WEIGHTS={
+    'boss':{
+        'boss-damage':1.35,'crit-rate':crit_weight,'crit-damage':1.20,
+        'skill-level-4':1.18,'defense-penetration':1.00,'damage':0.95,
+        'max-damage-ratio':0.92,'min-damage-ratio':0.92,'skill-damage':0.92,
+        'basic-attack-damage':0.70,'skill-level-3':0.68,'skill-level-2':0.50,
+        'skill-level-1':0.42,'attack':0.72,'main-stat':0.45,'normal-damage':0.04,
+    },
+    'normal':{
+        'normal-damage':1.35,'crit-rate':crit_weight,'crit-damage':1.20,
+        'skill-level-4':1.18,'damage':0.95,'max-damage-ratio':0.92,
+        'min-damage-ratio':0.92,'skill-damage':0.92,'basic-attack-damage':0.82,
+        'skill-level-3':0.68,'skill-level-2':0.50,'skill-level-1':0.42,
+        'attack':0.72,'main-stat':0.45,'boss-damage':0.04,'defense-penetration':0.25,
+    },
+}
+
+def stat_value(it,stat_type):
+    vals=[float(s.get('value',0) or 0) for s in it.get('stats',[]) if s.get('type')==stat_type]
+    return max(vals) if vals else 0.0
+
+def attack_substat(it): return stat_value(it,'attack')
+
+def damage_priority_score(it,category):
+    score=0.0
+    for st,w in WEIGHTS[category].items():
+        v=stat_value(it,st)
+        if not v: continue
+        if st=='crit-rate' and crit_need>0: v=min(v,crit_need)
+        score+=w*(v/NORM.get(st,1.0))
+    display_attack=float(it.get('attack',0) or 0)
+    score+=min(display_attack/30000.0,1.2)*0.16
+    has=lambda st: stat_value(it,st)>0
+    target='boss-damage' if category=='boss' else 'normal-damage'
+    if has('crit-damage') and has(target): score+=0.16
+    if crit_need>0 and has('crit-rate') and has('crit-damage'): score+=0.18
+    if crit_need>0 and has('crit-rate') and has(target): score+=0.14
+    if has('skill-level-4') and has(target): score+=0.15
+    return score
+
+def rank_for_category(slot,category,excluded):
+    candidates=[]
+    for iid,it in items.items():
+        if it.get('slot')!=slot or iid in excluded or iid not in status: continue
+        if category in ('boss','normal'):
+            primary=damage_priority_score(it,category)
+            if primary<=0.12: continue
+            target='boss-damage' if category=='boss' else 'normal-damage'
+            candidates.append((primary,stat_value(it,target),stat_value(it,'crit-damage'),
+                               stat_value(it,'crit-rate'),attack_substat(it),
+                               float(it.get('attack',0) or 0),-iid,iid))
+        else:
+            primary=stat_value(it,category)
+            if primary<=0: continue
+            secondary=max(damage_priority_score(it,'normal'),damage_priority_score(it,'boss'))
+            candidates.append((primary,secondary,attack_substat(it),float(it.get('attack',0) or 0),-iid,iid))
+    candidates.sort(reverse=True)
+    limit=5 if slot in SPECIAL_TOP5 else 3
+    return [x[-1] for x in candidates[:limit]]
+
 pools={s:{'boss':[],'normal':[],'evasion':[],'accuracy':[]} for s in slots}
-pools['hat']['normal']=[find('hat','23490')]
-pools['top']['boss']=[find('top','23420'),find('top','23375 h 70857'),find('top','23140')]
-pools['bottom']['boss']=[find('bottom','18135',lambda x:x['id']!=4220),find('bottom','23395'),find('bottom','20866')]; pools['bottom']['normal']=[find('bottom','23962')]
-pools['gloves']['boss']=[find('gloves','20614 eh 19 64499')]; pools['gloves']['accuracy']=[find('gloves','20277 h 65982')]
-pools['cape']['boss']=[find('cape','23425 m 27.2'),find('cape','26785'),find('cape','24040')]
-pools['belt']['boss']=[find('belt','16432 h 55776'),find('belt','18700')]
-pools['shoulder']['boss']=[find('shoulder','22485 h 69142')]; pools['shoulder']['normal']=[find('shoulder','26150 h 76875')]
-pools['shoes']['boss']=[find('shoes','16094')]
-pools['ring']['boss']=[find('ring','19344',lambda x:any(s['type']=='boss-damage' and s['value']==17.1 for s in x['stats'])),find('ring','18756'),find('ring','18924'),find('ring','17448',lambda x:any(s['type']=='boss-damage' for s in x['stats'])),find('ring','18090')]
-pools['ring']['normal']=[find('ring','18174'),find('ring','19158 h 92949'),find('ring','16902',lambda x:any(s['type']=='normal-damage' for s in x['stats'])),find('ring','16818',lambda x:any(s['type']=='normal-damage' for s in x['stats'])),find('ring','18906')]
-pools['ring']['evasion']=[find('ring','18216 e 32'),find('ring','17574 e 32'),find('ring','17280 e 32')]+find('ring','17154 e 32',all_=True)
-pools['ring']['accuracy']=[find('ring','18474 h 93651'),find('ring','17742'),find('ring','17406'),find('ring','17112',lambda x:any(s['type']=='accuracy' for s in x['stats'])),find('ring','17070',lambda x:any(s['type']=='accuracy' for s in x['stats']))]
-pools['ring2']['boss']=[find('ring2','17105'),find('ring2','15325 m 33.1')]
-pools['necklace']['boss']=[find('necklace','16483'),find('necklace','14877'),find('necklace','14845 e 25'),find('necklace','11565'),find('necklace','11965')]
-pools['necklace']['evasion']=[find('necklace','15579 e 27'),find('necklace','15210 e 27')]; pools['necklace']['accuracy']=[find('necklace','15394')]
-pools['eye']['accuracy']=[find('eye','13788')]
-pools['earring']['evasion']=[find('earring','15255 e 25'),find('earring','15145 e 25')]
-for s,cats in pools.items():
-    for cat,ids in cats.items(): cats[cat]=[i for i in ids if i and i not in used]
+allocated=set(used)
+for cat in ['boss','normal','evasion','accuracy']:
+    for s in slots:
+        chosen=rank_for_category(s,cat,allocated)
+        pools[s][cat]=chosen
+        allocated.update(chosen)
+
 poolids=set(i for cats in pools.values() for ids in cats.values() for i in ids)
 four={i for i,it in items.items() if len(it.get('stats',[]))>=4 and i in status}
 extra4=four-used-poolids
-keep=used|poolids|four
+
+# CONSERVATIVE SAFETY NET: bias strongly toward KEEP.
+pq_farmable_slots={'ring','ring2','face','necklace'}
+DAMAGE_CLUSTER={
+    'crit-rate','crit-damage','boss-damage','normal-damage','damage',
+    'max-damage-ratio','min-damage-ratio','defense-penetration',
+    'skill-damage','basic-attack-damage','skill-level-4','skill-level-3',
+    'skill-level-2','skill-level-1','attack'
+}
+
+def meaningful_damage_lines(it):
+    found=[]
+    for st in DAMAGE_CLUSTER:
+        v=stat_value(it,st)
+        if not v: continue
+        if st=='crit-rate' and crit_need<=0.5: continue
+        found.append(st)
+    return found
+
+def pq_slot_quality_keep(slot,it):
+    has=lambda st: stat_value(it,st)>0
+    if slot=='ring':
+        premium=sum(has(x) for x in ['crit-damage','skill-level-4','max-damage-ratio','min-damage-ratio','boss-damage','damage'])
+        if crit_need>0.5 and has('crit-rate') and premium>=1: return True
+        if premium>=2: return True
+    elif slot=='necklace':
+        premium=sum(has(x) for x in ['crit-damage','boss-damage','damage','attack'])
+        if crit_need>0.5 and has('crit-rate') and premium>=1: return True
+        if premium>=2: return True
+    elif slot=='face':
+        premium=sum(has(x) for x in ['crit-damage','skill-level-4','boss-damage','normal-damage','max-damage-ratio','min-damage-ratio','damage','attack'])
+        if crit_need>0.5 and has('crit-rate') and premium>=1: return True
+        if premium>=2: return True
+    elif slot=='ring2':
+        premium=sum(has(x) for x in ['skill-damage','crit-damage','skill-level-4','boss-damage','normal-damage','attack'])
+        if has('skill-damage') and premium>=2: return True
+        if crit_need>0.5 and has('crit-rate') and premium>=1: return True
+        if premium>=2: return True
+    return False
+
+safety_quality=set()
+for iid,it in items.items():
+    if iid not in status: continue
+    lines=meaningful_damage_lines(it)
+    if len(lines)>=2 or pq_slot_quality_keep(it['slot'],it): safety_quality.add(iid)
+
+UTILITY=['max-hp','max-mp','evasion','accuracy','defense']
+best_util={}
+for slot in slots:
+    for st in UTILITY:
+        best_util[(slot,st)]=max([stat_value(it,st) for iid,it in items.items() if it.get('slot')==slot and iid in status] or [0])
+safety_utility=set()
+for iid,it in items.items():
+    if iid not in status: continue
+    slot=it['slot']
+    for st in UTILITY:
+        v=stat_value(it,st); best=best_util[(slot,st)]
+        if v>0 and best>0 and v>=0.95*best:
+            safety_utility.add(iid); break
+
+safety_keep=safety_quality|safety_utility
+keep=used|poolids|four|safety_keep
 lock=[i for i in keep if i in status and not status[i]['locked']]
 unlock=[i for i,d in status.items() if d['locked'] and i not in keep and d['source']!='equipped']
 
@@ -100,15 +217,15 @@ def action_row(i):
     d=status[i]; m=meta.get(d['filename'],{})
     try: order=int(m.get('batch_capture_order') or 9999)
     except: order=9999
-    return {'order':order,'id':i,'slot':slot_labels[d['slot']], 'name':d['name'], 'tier':m.get('tier',''), 'level':m.get('level',''), 'sub':d['substats'][0] if d['substats'] else ''}
-slot_order={slot_labels[s]:n for n,s in enumerate(slots)}
-# Cleanup order: group by equipment type, then preserve true screenshot capture order within each type.
-lock_rows=sorted([action_row(i) for i in lock],key=lambda r:(slot_order[r['slot']],r['order']))
-unlock_rows=sorted([action_row(i) for i in unlock],key=lambda r:(slot_order[r['slot']],r['order']))
+    return {'order':order,'id':i,'slot_key':d['slot'],'slot':slot_labels[d['slot']], 'name':d['name'], 'tier':m.get('tier',''), 'level':m.get('level',''), 'sub':d['substats'][0] if d['substats'] else ''}
+slot_rank={s:i for i,s in enumerate(slots)}
+lock_rows=sorted([action_row(i) for i in lock],key=lambda r:(slot_rank[r['slot_key']],r['order']))
+unlock_rows=sorted([action_row(i) for i in unlock],key=lambda r:(slot_rank[r['slot_key']],r['order']))
 
 with open(TXT,'w',encoding='utf-8') as f:
     f.write('MapleStory Idle RPG - BIS Lock / Unlock Actions\n')
-    f.write('OCR v191 - grouped by item type, then screenshot capture order\n')
+    f.write('OCR v191 - grouped by equipment type, then screenshot capture order\n')
+    f.write('Spare pools: fresh whole-item priority scoring; unique Boss -> Normal -> Evasion -> Accuracy allocation\nConservative safety: recognised multi-line damage clusters + near-best utility rolls are kept rather than unlocked\n')
     if basic_mismatches:
         f.write('SAFETY: Basic preset corrected from OCR Equipped screenshots for: '+', '.join(slot_labels[s] for s,_,_ in basic_mismatches)+'\n')
     f.write('\n')
@@ -121,7 +238,6 @@ with open(TXT,'w',encoding='utf-8') as f:
         f.write('4-SUBSTAT ALWAYS-KEEP EXTRAS\n')
         for i in sorted(extra4): f.write(f"{slot_labels[items[i]['slot']]}  {items[i]['name']}\n")
 
-# ---------- PDF helpers ----------
 W,H=landscape(A3)
 c=canvas.Canvas(OUT,pagesize=(W,H))
 margin=28
@@ -162,8 +278,7 @@ def draw_cell(x,y,w,h,text,fill=None,bold=False,fs=7.0,align='left'):
         linefs=min(usefs,6.3)
         c.setFont(font,linefs)
         base=y+h/2+linefs*0.15
-        for j,line in enumerate(lines):
-            c.drawString(x+3,base-j*(linefs+0.8),line)
+        for j,line in enumerate(lines): c.drawString(x+3,base-j*(linefs+0.8),line)
 
 c.setFont('Helvetica-Bold',15); c.drawString(margin,H-32,'Equipment Set Cross-Reference')
 x0=margin; ytop=H-48
@@ -234,32 +349,33 @@ if basic_mismatches:
     c.drawRightString(W-margin,footer_y,'Basic corrected from OCR Equipped: '+', '.join(slot_labels[s] for s,_,_ in basic_mismatches))
 c.showPage()
 
-c.setFont('Helvetica-Bold',15); c.drawString(margin,H-32,'Lock / Unlock Actions - Item Type then Screenshot Order')
-c.setFont('Helvetica',8); c.drawString(margin,H-45,'Grouped by equipment type; within each type, sorted by v191 batch capture order. T/Lv and first visible substat are matched to the exact screenshot record.')
+c.setFont('Helvetica-Bold',15); c.drawString(margin,H-32,'Lock / Unlock Actions - Grouped by Item')
+c.setFont('Helvetica',10.0); c.drawString(margin,H-46,'Equipment type first, then v191 screenshot capture order within each type. T/Lv and first visible substat match the exact screenshot record.')
+c.setFont('Helvetica',8.8); c.drawString(margin,H-58,'Boss/Normal use whole-item priority scoring. Conservative safety keeps strong damage clusters and near-best utility rolls.')
 if basic_mismatches:
-    c.setFont('Helvetica-Bold',8); c.drawString(margin,H-56,'Safety correction: OCR Equipped overrides stale optimiser Basic for '+', '.join(slot_labels[s] for s,_,_ in basic_mismatches)+'.')
-    panel_y=H-72
+    c.setFont('Helvetica-Bold',8.2); c.drawString(margin,H-70,'Safety correction: OCR Equipped overrides stale optimiser Basic for '+', '.join(slot_labels[s] for s,_,_ in basic_mismatches)+'.')
+    panel_y=H-88
 else:
-    panel_y=H-62
+    panel_y=H-76
 
 def draw_action_panel(x,y,w,title,rows):
     header_h=30
     c.setFillColor(colors.HexColor('#d9d9d9')); c.rect(x,y-header_h,w,header_h,stroke=1,fill=1); c.setFillColor(colors.black)
-    c.setFont('Helvetica-Bold',17); c.drawCentredString(x+w/2,y-header_h+8,title)
+    c.setFont('Helvetica-Bold',19); c.drawCentredString(x+w/2,y-header_h+8,title)
     cy=y-header_h-5
     cols=[38,62,150,72,w-38-62-150-72]
     hdr=['Order','Slot','Item','T / Lv','First visible substat']
     hh=20
     xx=x
-    for j,h in enumerate(hdr): draw_cell(xx,cy-hh,cols[j],hh,h,fill=colors.HexColor('#eeeeee'),bold=True,fs=7.5); xx+=cols[j]
+    for j,h in enumerate(hdr): draw_cell(xx,cy-hh,cols[j],hh,h,fill=colors.HexColor('#eeeeee'),bold=True,fs=9.4); xx+=cols[j]
     cy-=hh
-    rh=24
+    rh=33
     if not rows:
-        draw_cell(x,cy-rh,w,rh,'No actions required',fs=8.5); cy-=rh
+        draw_cell(x,cy-rh,w,rh,'No actions required',fs=10.0); cy-=rh
     for r in rows:
         xx=x
         vals=[r['order'],r['slot'],r['name'],f"{r['tier']} Lv.{r['level']}",r['sub']]
-        for j,v in enumerate(vals): draw_cell(xx,cy-rh,cols[j],rh,v,fs=7.6,bold=False); xx+=cols[j]
+        for j,v in enumerate(vals): draw_cell(xx,cy-rh,cols[j],rh,v,fs=10.4,bold=False); xx+=cols[j]
         cy-=rh
     return cy
 
@@ -272,4 +388,4 @@ c.save()
 print(OUT)
 print(TXT)
 print('basic mismatches',[(s,a,b) for s,a,b in basic_mismatches])
-print('counts',len(status),len(keep & set(status)),len(lock_rows),len(unlock_rows),'extra4',len(extra4))
+print('counts',len(status),len(keep & set(status)),len(lock_rows),len(unlock_rows),'extra4',len(extra4),'safety_quality',len(safety_quality),'safety_utility',len(safety_utility))
